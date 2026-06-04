@@ -1,0 +1,99 @@
+name: CIEDE2000 Test in C++
+
+on:
+  workflow_dispatch:
+
+env:
+  n_csv_lines: 10000000
+
+jobs:
+  test-ciede2000-cpp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📂 For each step below, a new shell will be started at the repository root
+        uses: actions/checkout@v6
+
+      - name: 🛠️ Prepare the C++ test script
+        run: |
+            cp -p ciede2000.cpp ciede2000-driver.cpp
+            printf '%s\n' '' \
+            '#include <algorithm>' \
+            '#include <cctype>' \
+            '#include <fstream>' \
+            '#include <iostream>' \
+            '#include <sstream>' \
+            '#include <string>' \
+            '' \
+            'void rtrim(std::string& s) {' \
+            '	// Strip whitespace from the end of a string.' \
+            '	s.erase(std::find_if(s.rbegin(), s.rend(),' \
+            '			[](unsigned char ch) { return !std::isspace(ch); }).base(),' \
+            '		s.end());' \
+            '}' \
+            '' \
+            'int main(int argc, char* argv[]) {' \
+            '	const std::string filename = argv[1];' \
+            '	const bool canonical = 2 < argc;' \
+            '	std::ifstream file(filename);' \
+            '	std::string line;' \
+            '	while (std::getline(file, line)) {' \
+            '		rtrim(line);' \
+            '		std::istringstream iss(line);' \
+            '		std::string value;' \
+            "		const double l1 = (std::getline(iss, value, ','), std::stod(value));" \
+            "		const double a1 = (std::getline(iss, value, ','), std::stod(value));" \
+            "		const double b1 = (std::getline(iss, value, ','), std::stod(value));" \
+            "		const double l2 = (std::getline(iss, value, ','), std::stod(value));" \
+            "		const double a2 = (std::getline(iss, value, ','), std::stod(value));" \
+            "		const double b2 = (std::getline(iss, value, ','), std::stod(value));" \
+            "		const double kl = (std::getline(iss, value, ','), std::stod(value));" \
+            "		const double kc = (std::getline(iss, value, ','), std::stod(value));" \
+            "		const double kh = (std::getline(iss, value, ','), std::stod(value));" \
+            '		const double delta_e = ciede2000(l1, a1, b1, l2, a2, b2, kl, kc, kh, canonical);' \
+            '		std::printf("%s,%.14f\n", line.c_str(), delta_e);' \
+            '	}' \
+            '	return 0;' \
+            '}' \
+            '' >> ciede2000-driver.cpp
+
+      - name: 📦 Set up GCC
+        run: command -v gcc > /dev/null || { sudo apt-get update --allow-unauthenticated && sudo apt-get install --allow-unauthenticated --no-install-recommends --assume-yes gcc ; }
+
+      - name: 🌐️ Download the CIEDE2000 driver program
+        run: wget --no-verbose --no-check-certificate --timeout=5 --tries=2 https://ciede2000.pages-perso.free.fr/static/github/ciede2000-native-precision-driver.c
+
+      - name: ⚙️ Compile the CIEDE2000 driver program in C99
+        run: |
+            gcc --version && g++ --version
+            g++ -std=c++11 -Wall -pedantic -O2 -g ciede2000-driver.cpp -o ciede2000-cpp
+            gcc -std=c99 -Wall -pedantic -O2 -g ciede2000-native-precision-driver.c -o ciede2000-native -lm
+
+      - name: 🎨 Generate ΔE2000 color difference test cases
+        run: ./ciede2000-native --number $n_csv_lines --with-weights --output-file test-cases.csv
+
+      - name: 🚀 Run test cases in C++ and stream to verifier
+        run: |
+          ./ciede2000-cpp test-cases.csv             | ./ciede2000-native --precision 11 > summary-simplified.txt &
+          ./ciede2000-cpp test-cases.csv --canonical | ./ciede2000-native --precision 11 > summary-canonical.txt &
+          wait
+
+      - name: 🏁 Conclusion
+        run: |
+          for compliance in simplified canonical; do
+            file="summary-$compliance.txt"
+            cat "$file"
+            #
+            if [ "${file%canonical.txt}" = "$file" ]; then
+              Q1="[ ] CANONICAL [X] SIMPLIFIED"
+            else
+              Q1="[X] CANONICAL [ ] SIMPLIFIED"
+            fi
+            if grep -Fq "$Q1" "$file" && grep -Fq "Error : 0" "$file" && grep -Fq "Successes : $n_csv_lines" "$file"; then
+              echo "✔️ Verification of $file successful: all $n_csv_lines color differences were correctly calculated."
+            else
+              echo "❌ Verification failed. See above for details."
+              exit 1
+            fi
+          done
