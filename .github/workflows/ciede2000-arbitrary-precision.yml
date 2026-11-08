@@ -1,0 +1,99 @@
+name: CIEDE2000 Test in C++ (Arbitrary Precision)
+
+on:
+  workflow_dispatch:
+
+env:
+  n_csv_lines: 100000
+
+jobs:
+  test-ciede2000-cpp-arbitrary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📂 Checkout repository
+        uses: actions/checkout@v7
+
+      - name: 📦 Set up GCC, MPFR, GMP and Boost
+        run: |
+          command -v gcc > /dev/null || { sudo apt-get update --allow-unauthenticated && sudo apt-get install --allow-unauthenticated --no-install-recommends --assume-yes gcc ; }
+          command -v g++ > /dev/null || { sudo apt-get update --allow-unauthenticated && sudo apt-get install --allow-unauthenticated --no-install-recommends --assume-yes g++ ; }
+          sudo apt-get update --allow-unauthenticated && sudo apt-get install --allow-unauthenticated --no-install-recommends --assume-yes libmpfr-dev libgmp-dev libboost-dev
+
+      - name: 🔧 Prepare the C++ driver wrapper
+        run: |
+          cat << 'EOF' > ciede2000-arbitrary-precision.cpp
+          #include <iostream>
+          #include <fstream>
+          #include <sstream>
+          #include <string>
+          #include <vector>
+          #include <iomanip>
+          #include <boost/multiprecision/cpp_dec_float.hpp>
+          #include "ciede2000-arbitrary-precision.hpp" 
+          using cpp_dec_float_arbitrary = boost::multiprecision::number<boost::multiprecision::cpp_dec_float<65>>;
+          int main(int argc, char* argv[]) {
+              std::ios_base::sync_with_stdio(false);
+              std::cin.tie(NULL);
+              if (argc < 2) return 1;
+              bool canonical = (argc > 2 && std::string(argv[2]) == "--canonical");
+              std::ifstream file(argv[1]);
+              std::string line;
+              while (std::getline(file, line)) {
+                  std::stringstream ss(line);
+                  std::string item;
+                  std::vector<cpp_dec_float_arbitrary> v;
+                  while (std::getline(ss, item, ',')) {
+                      v.push_back(cpp_dec_float_arbitrary(item));
+                  }
+                  if (v.size() >= 6) {
+                      cpp_dec_float_arbitrary kl = v.size() > 6 ? v[6] : cpp_dec_float_arbitrary(1);
+                      cpp_dec_float_arbitrary kc = v.size() > 7 ? v[7] : cpp_dec_float_arbitrary(1);
+                      cpp_dec_float_arbitrary kh = v.size() > 8 ? v[8] : cpp_dec_float_arbitrary(1);
+                      cpp_dec_float_arbitrary de = ciede2000<cpp_dec_float_arbitrary>(
+                          v[0], v[1], v[2], v[3], v[4], v[5], kl, kc, kh, canonical
+                      );
+                      std::cout << line << "," << std::setprecision(53) << de << "\n";
+                  }
+              }
+              return 0;
+          }
+          EOF
+
+      - name: 🌐️ Download the CIEDE2000 driver program
+        run: wget --no-verbose --no-check-certificate --timeout=5 --tries=2 https://ciede2000.pages-perso.free.fr/static/github/ciede2000-arbitrary-precision-driver.c
+
+      - name: ⚙️ Compile the C verifier and C++ driver
+        run: |
+          gcc -std=c99 -Wall -pedantic -O2 -g ciede2000-arbitrary-precision-driver.c -o ciede2000-arbitrary -lmpfr -lgmp
+          g++ -std=c++17 -Wall -O2 ciede2000-arbitrary-precision.cpp -o run-ciede2000-cpp
+
+      - name: 🎨 Generate ΔE2000 color difference test cases
+        run: ./ciede2000-arbitrary --number ${{ env.n_csv_lines }} --with-weights --output-file test-cases.csv
+
+      - name: 🚀 Run test cases in C++ and stream to verifier
+        run: |
+          ./run-ciede2000-cpp test-cases.csv --canonical | ./ciede2000-arbitrary --precision 50 --output-file summary-canonical.txt &
+          ./run-ciede2000-cpp test-cases.csv | ./ciede2000-arbitrary --precision 50 --output-file summary-simplified.txt &
+          wait
+
+      - name: 🏁 Conclusion
+        run: |
+          for compliance in simplified canonical; do
+            file="summary-$compliance.txt"
+            cat "$file"
+            
+            if [ "${file%canonical.txt}" = "$file" ]; then
+              Q1="[ ] CANONICAL [X] SIMPLIFIED"
+            else
+              Q1="[X] CANONICAL [ ] SIMPLIFIED"
+            fi
+            
+            if grep -Fq "$Q1" "$file" && grep -Fq "Error : 0" "$file" && grep -Fq "Successes : ${{ env.n_csv_lines }}" "$file"; then
+              echo "✔️ Verification of $file successful: all ${{ env.n_csv_lines }} color differences were correctly calculated."
+            else
+              echo "❌ Verification failed. See above for details."
+              exit 1
+            fi
+          done

@@ -1,0 +1,119 @@
+name: CIEDE2000 Test in C++ (constexpr)
+
+on:
+  workflow_dispatch:
+
+env:
+  n_csv_lines: 500000
+  n_csv_lines_by_file: 25000
+
+jobs:
+  test-ciede2000-cpp-constexpr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📂 For each step below, a new shell will be started at the repository root
+        uses: actions/checkout@v7
+
+      - name: 📦 Set up GCC
+        run: |
+          echo "Checking and installing gcc if missing..."
+          command -v gcc > /dev/null || { sudo apt-get update --allow-unauthenticated && sudo apt-get install --allow-unauthenticated --no-install-recommends --assume-yes gcc ; }
+          command -v g++ > /dev/null || { sudo apt-get update --allow-unauthenticated && sudo apt-get install --allow-unauthenticated --no-install-recommends --assume-yes g++ ; }
+
+      - name: 🌐️ Download the CIEDE2000 driver program
+        run: |
+          echo "Downloading the official C99 driver for CIEDE2000 in native precision..."
+          wget --no-verbose --no-check-certificate --timeout=5 --tries=2 https://ciede2000.pages-perso.free.fr/static/github/ciede2000-native-precision-driver.c
+
+      - name: ⚙️ Compile the CIEDE2000 driver program in C99
+        run: |
+          echo "Displaying compiler versions:"
+          gcc --version && g++ --version
+          
+          echo "Compiling the C99 driver for CIEDE2000..."
+          gcc -std=c99 -Wall -pedantic -O2 -g ciede2000-native-precision-driver.c -o ciede2000-native -lm
+
+      - name: 🎨 Generate ΔE2000 color difference test cases
+        run: |
+          echo "Generating $n_csv_lines test cases..."
+          ./ciede2000-native --number $n_csv_lines --with-weights --output-file test-cases.csv
+
+      - name: 🔪 Split test cases into smaller chunks
+        run: |
+          echo "Streaming simplified tests to chunk files..."
+          ./ciede2000-native --input-file test-cases.csv |
+          stdbuf -o0 split --suffix-length=7 --lines=$n_csv_lines_by_file --numeric-suffixes=1 - tests-simplified-
+          
+          echo "Streaming canonical tests to chunk files..."
+          ./ciede2000-native --canonical --input-file test-cases.csv |
+          stdbuf -o0 split --suffix-length=7 --lines=$n_csv_lines_by_file --numeric-suffixes=1 - tests-canonical-
+          
+          echo "Removing the original large CSV file..."
+          rm test-cases.csv
+
+      - name: 📝 Generate C++ source files with static_assert
+        run: |
+          echo "Extracting the constexpr implementation (removing main function)..."
+          sed '/int main/Q' ciede2000-constexpr.cpp > header.hpp
+          
+          echo "Generating .cpp files for each test chunk..."
+          for chunk_file in tests-*; do
+            # Determine if the current chunk is canonical or simplified
+            if [ "${chunk_file#tests-c}" = "$chunk_file" ]; then
+              is_canonical_mode=false
+            else
+              is_canonical_mode=true
+            fi
+            
+            cpp_file="${chunk_file}.cpp"
+            
+            # Assemble the C++ file
+            cat header.hpp > "$cpp_file"
+            echo "int main() {" >> "$cpp_file"
+            
+            # Append a static_assert for each CSV line
+            awk -v mode="$is_canonical_mode" -F',' '{
+              printf "\tstatic_assert(std::fabs(ciede2000(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) - %s) < 1E-12);\n", \
+                     $1, $2, $3, $4, $5, $6, $7, $8, $9, mode, $10
+            }' "$chunk_file" >> "$cpp_file"
+            
+            echo "}" >> "$cpp_file"
+            
+            # Clean up the processed text chunk
+            rm "$chunk_file"
+          done
+          
+          # Shows the name and size of newly created C++ files
+          du -h tests-*.cpp | awk '{print "The file "$2" ("$1"B) contains `static_assert` concerning L*a*b* colors, parametric factors, and their CIEDE2000 color difference."}'
+
+      - name: 🚀 Run test cases in C++ (constexpr) and provide the conclusion
+        run: |
+          echo "Detecting available CPU cores..."
+          if command -v nproc > /dev/null 2>&1; then
+            cpu_cores="$(nproc)"
+          else
+            cpu_cores="$(getconf _NPROCESSORS_ONLN 2> /dev/null || echo 1)"
+          fi
+          
+          total_cpp_files=$(ls tests-*.cpp | wc -l)
+          echo "==> Starting constexpr (C++26) validation on $cpu_cores cores for $total_cpp_files files <=="
+          
+          # Run compilations in parallel using xargs
+          ls tests-*.cpp | xargs -P "$cpu_cores" -I {} bash -c '
+            if g++ -std=c++26 -O0 -c "$1" -o "${1%.cpp}.o"; then
+              echo "✔️ [OK] $1"
+            else
+              echo "❌ [ERROR] Compilation failed (static_assert triggered) on $1"
+              exit 255
+            fi
+          ' _ {}
+          
+          # Check xargs exit code to determine workflow success
+          if [ $? -eq 0 ]; then
+              echo "✔️ Verification successful: all $n_csv_lines color differences were correctly calculated."
+            else
+              echo "❌ Verification failed. See above for details."
+              exit 1
+          fi
